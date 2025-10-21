@@ -1,0 +1,5 @@
+gudhi
+numpy
+matplotlib
+Pillow
+tqdm
