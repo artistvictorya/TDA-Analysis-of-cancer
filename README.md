@@ -43,7 +43,3 @@ In the context of prostate cancer histopathology, we are interested in dimension
     * The appearance of loops with **lower persistence** (shorter-lived, irregular shapes).
 
 **Conclusion:** By comparing the PD of an unknown sample against the PD of a **healthy reference tissue**, a larger Bottleneck Distance likely indicates **cancerous changes** (tumor tissue).
-
----
-
-Would you like me to generate a set of **simulated diagram files** (one "Normal" reference and one "Cancerous" test file) so you can test the `analyze.sh` and `TDA_Analysis.py` comparison functionality right away?
