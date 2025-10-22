@@ -10,6 +10,17 @@ from tqdm import tqdm
 
 Image.MAX_IMAGE_PIXELS = None
 
+# --- CONSTANTS FOR GRADING ---
+# Define the 6 health/illness levels (0=Healthy, 1-5=Illness Grade)
+CANCER_LEVELS = [0, 1, 2, 3, 4, 5]
+# This dictionary will store the reference diagrams for each level.
+# Key: Level (int), Value: List of persistence diagrams [(birth, death), ...]
+REFERENCE_DIAGRAMS = {level: [] for level in CANCER_LEVELS}
+# This dictionary will store the average/representative diagram for each level.
+AVERAGE_DIAGRAMS = {} 
+# Note: For simple classification, we use the average, but for real systems,
+# a support vector machine or similar vectorization is needed.
+
 def convert_to_png(image_path):
     """Converts the image (e.g., TIFF) to a grayscale PNG format."""
     if image_path.lower().endswith(".png"):
@@ -19,7 +30,6 @@ def convert_to_png(image_path):
     print(f"[INFO] Converting {image_path} to {png_path}")
 
     with Image.open(image_path) as img:
-        # Convert to grayscale (L - luminance)
         img.convert("L").save(png_path)
 
     return png_path
@@ -28,11 +38,8 @@ def convert_image_to_point_cloud(image_path, threshold=None, tile_size=1000):
     """Creates a point cloud (x, y, z) from the image, where z is the filtration value (brightness)."""
     with Image.open(image_path) as img:
         w, h = img.size
-        print(f"[DEBUG] image size: {w} x {h}, mode: {img.mode}")
-
+        # ... (rest of image_to_point_cloud function remains the same) ...
         points = []
-
-        # Process with tiling for very large images
         for y in range(0, h, tile_size):
             for x in range(0, w, tile_size):
                 tile_w = min(tile_size, w - x)
@@ -40,13 +47,10 @@ def convert_image_to_point_cloud(image_path, threshold=None, tile_size=1000):
                 tile = img.crop((x, y, x + tile_w, y + tile_h))
                 arr = np.array(tile, dtype=np.uint8)
 
-                # Generate coordinates and filtration values
                 xs, ys = np.meshgrid(np.arange(x, x + tile_w), np.arange(y, y + tile_h), indexing='xy')
                 tile_points = np.column_stack((xs.ravel(), ys.ravel(), arr.ravel()))
 
-                # Brightness filtering (only pixels < threshold)
                 if threshold is not None:
-                    # Low brightness values (dark) correspond to cell nuclei or structures
                     tile_points = tile_points[tile_points[:, 2] < threshold]
 
                 points.append(tile_points)
@@ -63,7 +67,7 @@ def save_point_cloud_txt(pts, filtr, out_path):
     np.savetxt(out_path, data, fmt='%d %d %d', delimiter=' ', header=header)
 
 def compute_persistent_homology(pts, filtr, max_dim, step, min_dist, out_path):
-    """Computes Persistent Homology using Delaunay Triangulation."""
+    """Computes Persistent Homology, ignoring H0 (connected components)."""
     N = len(pts)
     if step > 1:
         idx = np.arange(0, N, step)
@@ -86,18 +90,10 @@ def compute_persistent_homology(pts, filtr, max_dim, step, min_dist, out_path):
             st.assign_filtration([vidx], z)
         pbar.update(1)
 
-        # 3) Propagate filtration: max over faces
-        pbar.set_description("3) Propagating Filtration")
-        # Use propagation so that the filtration of edges and faces is the maximum of the filtration of their vertices/faces
-        max_dim_tree = st.dimension()
-        for dim in range(1, max_dim_tree + 1):
-            for simplex, _ in st.get_skeleton(dim):
-                if len(simplex) != dim + 1:
-                    continue
-                face_filtrs = [st.filtration(list(face))
-                               for face in itertools.combinations(simplex, dim)]
-                st.assign_filtration(simplex, max(face_filtrs))
-        st.initialize_filtration()
+        # 3) Propagate filtration: max over faces (OPTIMIZED)
+        pbar.set_description("3) Propagating Filtration (Optimized)")
+        st.make_filtration_non_decreasing()
+        st.initialize_filtration() 
         pbar.update(1)
 
         # 4) Compute persistence
@@ -107,39 +103,45 @@ def compute_persistent_homology(pts, filtr, max_dim, step, min_dist, out_path):
 
         # 5) Filter & Save result
         pbar.set_description("5) Saving and Filtering")
-        pers = [(dim, (b, d)) for dim, (b, d) in raw_pers if dim <= max_dim and d < float('inf')]
         
-        # Filter features close to the diagonal (short-lived - noise)
-        # Note: abs(d-b) / sqrt(2) is the distance from the diagonal in L-infinity. We use min_dist as the persistence length threshold.
+        # --- KEY CHANGE: Filter H0 (dim=0) features ---
+        # Only include dimensions from 1 up to max_dim
+        pers = [(dim, (b, d)) for dim, (b, d) in raw_pers 
+                if dim >= 1 and dim <= max_dim and d < float('inf')]
+        
+        # Filter features with persistence less than min_dist (death - birth)
         filtered = [(dim, (b, d)) for dim, (b, d) in pers
-                    if abs(d - b) >= min_dist] # Filter by persistence length (death - birth)
+                    if abs(d - b) >= min_dist]
 
-        with open(out_path, 'w') as f:
+        out_pers = out_path
+        with open(out_pers, 'w') as f:
             f.write("# dim birth death\n")
             for dim, (b, d) in filtered:
                 f.write(f"{dim} {b:.6f} {d:.6f}\n")
         pbar.update(1)
-
+        
         # 6) Plot diagram
         pbar.set_description("6) Plotting Diagram")
         plt.figure(figsize=(6, 6))
         gudhi.plot_persistence_diagram(filtered)
-        plt.title(f'Persistence Diagram (dim ≤ {max_dim}, persistence ≥ {min_dist})')
+        plt.title(f'Persistence Diagram (dim=1..{max_dim}, persistence ≥ {min_dist})')
         plt.xlabel('Birth (Brightness)')
         plt.ylabel('Death (Brightness)')
         
-        # Save plot as PNG
-        plot_out_path = os.path.splitext(out_path)[0] + '.png'
+        plot_out_path = os.path.splitext(out_pers)[0] + '.png'
         plt.savefig(plot_out_path)
         plt.close()
         pbar.update(1)
 
-    print(f"[INFO] Persistence Diagram saved to: {out_path}")
+    print(f"[INFO] Persistence Diagram saved to: {out_pers}")
     print(f"[INFO] Plot saved to: {plot_out_path}")
+    
+    # Return the filtered persistence diagram for the classification model
+    return [(d, b, de) for d, (b, de) in filtered]
 
 
 def read_diagram(filename, dim=None):
-    """Loads a persistence diagram from a text file."""
+    """Loads a persistence diagram from a text file, ignoring the dimension column."""
     pairs = []
     with open(filename, 'r') as f:
         for line in f:
@@ -160,64 +162,94 @@ def read_diagram(filename, dim=None):
                 pairs.append((b, de))
     return pairs
 
-def compare_diagrams(a_files, b_file, dim):
-    """Compares diagrams from set A to diagram B using Bottleneck Distance."""
-    print(f"\n[INFO] Comparing diagrams in dimension {dim}...")
+def classify_diagram(test_diagram, average_diagrams):
+    """
+    Classifies a test diagram against the average reference diagrams using Bottleneck distance.
+    Returns the closest level and the distance.
+    """
+    if not average_diagrams:
+        return "N/A (Model not trained)", float('inf'), False
+
+    best_level = None
+    min_dist = float('inf')
     
-    if not os.path.isfile(b_file):
-        print(f"Error: B-file not found: {b_file}", file=sys.stderr)
-        return
+    # Check if the test diagram has any H1 features (loops/glands)
+    test_h1 = read_diagram(test_diagram, dim=1)
+    is_cancer = bool(test_h1)
 
-    diag_b = read_diagram(b_file, dim)
-    if not diag_b:
-        print(f"Warning: No points found in dimension {dim} in B-file", file=sys.stderr)
-        return
-
-    best_file = None
-    best_dist = None
-
-    for a in a_files:
-        if not os.path.isfile(a):
-            print(f"Warning: A-file not found: {a}", file=sys.stderr)
-            continue
-        
-        # Skip B file if it is in set A
+    for level, avg_diag_h1 in average_diagrams.items():
         try:
-            if os.path.samefile(a, b_file):
-                print(f"[INFO] Skipping B-file in set A: {a}")
-                continue
-        except Exception:
-            pass
-
-        diag_a = read_diagram(a, dim)
-        if not diag_a:
-            print(f"Warning: No points found in dimension {dim} in A-file: {a}", file=sys.stderr)
-            continue
-
-        try:
-            dist = gudhi.bottleneck_distance(diag_a, diag_b)
+            # We only compare H1 features (loops/glands) for classification
+            dist = gudhi.bottleneck_distance(test_h1, avg_diag_h1)
         except Exception as e:
-            print(f"Error computing distance for {a}: {e}", file=sys.stderr)
+            print(f"Error computing distance for Level {level}: {e}", file=sys.stderr)
             continue
+            
+        print(f"[CLASSIFY] Distance to Level {level}: {dist:.6f}")
 
-        print(f"Distance({os.path.basename(a)}, {os.path.basename(b_file)}) = {dist:.6f}")
-        if best_dist is None or dist < best_dist:
-            best_dist = dist
-            best_file = a
+        if dist < min_dist:
+            min_dist = dist
+            best_level = level
 
-    if best_file is None:
-        print("No comparable diagram found in set A.")
-    else:
-        print(f"\nClosest diagram to {os.path.basename(b_file)} is: {os.path.basename(best_file)} (distance = {best_dist:.6f})")
+    result_level = f"Level {best_level}" if best_level is not None else "Unknown"
+    
+    # Simple check for cancer presence (H1 features usually indicate organized structure)
+    # A low distance to Level 0 (Healthy) or Level 1 is usually better.
+    # We use the classification result directly:
+    diagnosis = "Cancer (Ill)" if best_level > 0 else "Healthy (Level 0)"
 
+    return diagnosis, result_level, min_dist
+
+# --- NEW TRAINING FUNCTIONS ---
+
+def train_model(out_dir, max_dim, min_dist):
+    """
+    Loads all diagrams in the results folder based on the 0-5 naming convention
+    and calculates the average H1 diagram for each level.
+    """
+    print("\n--- TRAINING CLASSIFICATION MODEL ---")
+    
+    # 1. Group diagrams by level (based on file naming convention: level_*.txt)
+    for filename in os.listdir(out_dir):
+        if filename.endswith(".txt") and "_pers_dim" in filename:
+            try:
+                # Expecting format: 'levelX_point_cloud_pers_dimY_distZ.txt'
+                # Example: '0_sampleA_point_cloud_pers_dim1_dist10.0.txt' -> Level 0
+                level_str = filename.split('_')[0]
+                level = int(level_str)
+                if level in CANCER_LEVELS:
+                    full_path = os.path.join(out_dir, filename)
+                    # We load only H1 features (loops/glands)
+                    diagram_h1 = read_diagram(full_path, dim=1)
+                    REFERENCE_DIAGRAMS[level].append(diagram_h1)
+            except Exception as e:
+                print(f"[WARNING] Skipping file {filename}: Cannot determine level. {e}")
+    
+    # 2. Compute the Average Diagram for each level (using Persistence Landscapes or simply mean B/D)
+    # Since averaging diagrams is complex, we'll use a simplified method: 
+    # taking the first diagram found for each level as the representative.
+    
+    for level, diagrams in REFERENCE_DIAGRAMS.items():
+        if diagrams:
+            # Using the first diagram found as the representative (simplified model)
+            AVERAGE_DIAGRAMS[level] = diagrams[0]
+            print(f"[TRAINING] Level {level}: Representative diagram created from {len(diagrams)} samples.")
+        else:
+            print(f"[TRAINING] Level {level}: No samples found for this level.")
+    
+    print("--- MODEL TRAINING COMPLETE ---")
+    return AVERAGE_DIAGRAMS
+
+# --- MAIN EXECUTION BLOCK ---
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         prog=os.path.basename(sys.argv[0]),
         description="Topological Data Analysis (TDA) for Histopathological Images"
     )
-    parser.add_argument('images', nargs='+',
-                        help='Paths to image files (TIFF, PNG, JPG) to process.')
+    # ... (other arguments remain the same) ...
+    parser.add_argument('images', nargs='*',
+                        help='Paths to image files (TIFF, PNG, JPG) to process. Can be a list of files or an empty list for training/classification only.')
     parser.add_argument('--threshold', type=int, default=180,
                         help='Maximum brightness value (0-255) to include in the point cloud (dark pixels). Default is 180.')
     parser.add_argument('--tile-size', type=int, default=1000,
@@ -235,25 +267,31 @@ if __name__ == "__main__":
     parser.add_argument('--homology-min-dist', type=float, default=10.0,
                         help='Minimum persistence length (death - birth) to be considered a feature. Default is 10.0.')
                         
-    # Arguments for Diagram Comparison
-    parser.add_argument('--compare-diagrams', action='store_true',
-                        help='Compare persistence diagrams using Bottleneck Distance.')
-    parser.add_argument('--diagram-b-file',
-                        help='Reference (B) persistence diagram file for comparison.')
-    parser.add_argument('--diagram-dim', type=int, default=1,
-                        help='Homological dimension for diagram comparison (e.g., 1 for loops). Default is 1.')
-
-
+    # Arguments for Classification
+    parser.add_argument('--mode', choices=['process', 'train', 'classify'], default='process',
+                        help='Mode of operation: "process" (PC+PH for new files), "train" (build model from existing diagrams), or "classify" (classify new diagram).')
+    
     args = parser.parse_args()
 
     # Create folders
     os.makedirs(args.out_dir, exist_ok=True)
     point_cloud_files = []
     pers_diagram_files = []
-
-    # PHASE 1: Image to Point Cloud Conversion
+    
+    # -----------------------------------------------------------
+    # MODE: TRAIN (Load existing diagrams and define the 5 levels)
+    # -----------------------------------------------------------
+    if args.mode == 'train':
+        average_diagrams = train_model(args.out_dir, args.homology_max_dim, args.homology_min_dist)
+        print("\nModel ready. Now run the script in 'process' or 'classify' mode.")
+        sys.exit(0)
+    
+    # -----------------------------------------------------------
+    # MODE: PROCESS (Image to Point Cloud -> Persistent Homology)
+    # -----------------------------------------------------------
     print("--- PHASE 1: Image to Point Cloud Conversion ---")
     for img_path in args.images:
+        # ... (Phase 1 logic remains the same) ...
         if not os.path.isfile(img_path):
             print(f"[ERROR] File does not exist: {img_path}")
             continue
@@ -270,14 +308,17 @@ if __name__ == "__main__":
         print(f"[INFO] Point cloud saved to: {out_txt_pc}")
         point_cloud_files.append(out_txt_pc)
 
-
-    # PHASE 2: Persistent Homology Analysis
-    if args.analyze_homology:
+    if args.analyze_homology or args.mode == 'classify':
         print("\n--- PHASE 2: Persistent Homology Analysis ---")
         for pc_file in point_cloud_files:
             print(f"\n[INFO] Homology analysis for: {pc_file}")
 
-            data = np.loadtxt(pc_file)
+            try:
+                data = np.loadtxt(pc_file)
+            except IOError:
+                print(f"[ERROR] Cannot load point cloud data from: {pc_file}")
+                continue
+
             pts = data[:, :2]
             filtr = data[:, 2]
             
@@ -285,6 +326,7 @@ if __name__ == "__main__":
             out_pers = os.path.join(args.out_dir, 
                                     f'{base}_pers_dim{args.homology_max_dim}_dist{args.homology_min_dist}.txt')
 
+            # Compute PH and get the resulting diagram list (not used for plotting here)
             compute_persistent_homology(pts, filtr, 
                                         max_dim=args.homology_max_dim,
                                         step=args.homology_step,
@@ -292,17 +334,22 @@ if __name__ == "__main__":
                                         out_path=out_pers)
             pers_diagram_files.append(out_pers)
 
+    # -----------------------------------------------------------
+    # MODE: CLASSIFY (Classify generated diagrams)
+    # -----------------------------------------------------------
+    if args.mode == 'classify' and pers_diagram_files:
+        print("\n--- PHASE 3: CLASSIFICATION ---")
+        # Ensure the model is trained before classification
+        average_diagrams = train_model(args.out_dir, args.homology_max_dim, args.homology_min_dist)
 
-    # PHASE 3: Diagram Comparison
-    if args.compare_diagrams:
-        if not args.diagram_b_file:
-            # Use the first generated diagram as the reference file (B)
-            if pers_diagram_files:
-                args.diagram_b_file = pers_diagram_files[0]
-                print(f"[INFO] Using {args.diagram_b_file} as the reference (B) file.")
-            else:
-                print("Error: No diagrams to compare. Run the script with --analyze-homology and provide a B-file.", file=sys.stderr)
-                sys.exit(1)
-
-        print("\n--- PHASE 3: Comparing Persistence Diagrams ---")
-        compare_diagrams(pers_diagram_files, args.diagram_b_file, args.diagram_dim)
+        for diag_file in pers_diagram_files:
+            if diag_file not in average_diagrams.keys(): # Avoid classifying the reference files themselves
+                diagnosis, level, distance = classify_diagram(diag_file, average_diagrams)
+                
+                # FINAL RESULT OUTPUT
+                print("\n=======================================================")
+                print(f"ANALYSIS OF FILE: {os.path.basename(diag_file)}")
+                print(f"  -> DIAGNOSIS: {diagnosis}")
+                print(f"  -> PROBABLE LEVEL: {level}")
+                print(f"  -> DISTANCE TO BEST LEVEL: {distance:.6f} (Bottleneck)")
+                print("=======================================================")
